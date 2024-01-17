@@ -1,0 +1,181 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse
+import socket
+import time
+import json
+import select
+import sys
+from collections import deque
+
+DATA_SIZE = 1375
+
+'''
+The sender class handles sending messages to the receiver.
+'''
+class Sender:
+    '''
+    Initializes the sender.
+    Parameters:
+        host: The remote host.
+        port: The remote port.
+    '''
+    def __init__(self, host, port):
+        self.host = host
+        self.remote_port = int(port)
+        self.log("Sender starting up using port %s" % self.remote_port)
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('0.0.0.0', 0))
+        self.waiting = False
+
+        self.window_size = 6
+        self.ss_thresh = 8
+        self.ack_count = self.window_size
+        self.duplicate_ack_count = 0
+        self.sequence_deque = deque()
+        self.sequence_time = {}
+        self.sequence_dict = {}
+        self.rtt = 1
+
+    '''
+    Logs a message to stderr.
+    Parameters:
+        message: The message to log.
+    '''
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    '''
+    Sends the message to the remote host.
+    Parameters:
+        message: The message to send.
+    '''
+    def send(self, message):
+        self.socket.sendto(json.dumps(message).encode(
+            'utf-8'), (self.host, self.remote_port))
+
+    '''
+    Gets the sequence number from the message.
+    Parameters:
+        message: The message to get the sequence number from.
+    Returns:
+        The sequence number.
+    '''
+    def get_sequence_number(self, message):
+        return int(message[12:19])
+
+    '''
+    Sends the lost message.
+    '''
+    def send_lost(self):
+        sequence_num = self.sequence_deque.popleft()
+        self.send(self.sequence_dict[sequence_num])
+        self.sequence_time[sequence_num] = time.time()
+        self.sequence_deque.append(sequence_num)
+        self.ss_thresh = max(self.window_size / 2, 2)
+        self.window_size = 2
+
+    '''
+    Detects whether the message is mangled.
+    Parameters:
+        msg: The message to check.
+    Returns:
+        True if the message is mangled, False otherwise.
+    '''
+    def detect_mangled(self, msg):
+        return 'X' in msg
+    
+    '''
+    Adjusts the window size based on the current window size and the slow start threshold.
+    '''
+    def adjust_window_size(self):
+        if self.window_size < self.ss_thresh:
+            self.window_size += 1
+            self.ack_count = min(int(self.window_size), self.ack_count + 2)
+        else:
+            self.window_size += 1 / self.window_size
+            self.ack_count = min(int(self.window_size), self.ack_count + 1)
+
+    '''
+    Receives an ack message and adjusts the window size accordingly.
+    Parameters:
+        msg: The ack message received.
+    '''
+    def receive_ack(self, msg):
+        if msg['type'] == 'ack':
+            if msg['sequence'] in self.sequence_deque:
+                self.adjust_window_size()
+                self.sequence_deque.remove(msg['sequence'])
+                self.rtt -= 0.5
+            else:
+                self.duplicate_ack_count += 1
+                if self.duplicate_ack_count == 3:
+                    self.window_size /= 2
+                    self.duplicate_ack_count = 0
+
+    '''
+    Handles the stdin input.
+    '''
+    def handle_stdin(self):
+        for i in range(self.ack_count):
+            current_time = time.time()
+            if len(self.sequence_deque) > 0 and current_time - self.sequence_time[self.sequence_deque[0]] >= self.rtt:
+                self.rtt += 1
+                self.send_lost()
+            else:
+                if self.read_stdin() == -1:
+                    break
+
+    '''
+    Reads from stdin and sends the message.
+    Returns:
+        0 if the message was sent successfully, -1 otherwise.'''
+    def read_stdin(self):
+        data = sys.stdin.read(DATA_SIZE)
+        if len(data) == 0:
+            if self.ack_count == int(self.window_size) and len(self.sequence_deque) == 0:
+                self.log("All done!")
+                sys.exit(0)
+            else:
+                return -1
+        sequence_num = self.get_sequence_number(data)
+        msg = { "type": "msg", "sequence": sequence_num, "data": data }
+        self.sequence_dict[sequence_num] = msg
+        self.sequence_time[sequence_num] = time.time()
+        self.sequence_deque.append(sequence_num)
+        self.log("Sending message '%s'" % msg)
+        self.send(msg)
+        self.ack_count -= 1
+        self.waiting = True
+        return 0
+
+    '''
+    Runs the sending protocol.
+    '''
+    def run(self):
+        while True:
+            sockets = [self.socket, sys.stdin] if not self.waiting else [self.socket]
+            socks = select.select(sockets, [], [], 0.1)[0]
+            for conn in socks:
+                if conn == self.socket:
+                    k, addr = conn.recvfrom(65535)
+                    msg = k.decode('utf-8')
+                    self.log("Received message '%s'" % msg)
+                    if self.detect_mangled(msg):
+                        self.send_lost()
+                        continue
+                    json_msg = json.loads(msg)
+                    self.receive_ack(json_msg)
+                    self.waiting = False
+                elif conn == sys.stdin:
+                    self.handle_stdin()
+        return
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='data sent')
+    parser.add_argument('host', type=str, help="Remote host")
+    parser.add_argument('port', type=int, help="UDP port number")
+    args = parser.parse_args()
+    sender = Sender(args.host, args.port)
+    sender.run()

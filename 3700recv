@@ -1,0 +1,94 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, json, select, sys
+
+class Receiver:
+    
+    '''
+    Initializes the receiver.
+    '''
+    def __init__(self):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('0.0.0.0', 0))
+        self.port = self.socket.getsockname()[1]
+        self.log("Bound to port %d" % self.port)
+
+        self.remote_host = None
+        self.remote_port = None
+
+        self.sequence_received = {}
+        self.sequence_count = 0
+
+    '''
+    Sends a message to the remote host.
+    Parameters:
+        message: The message to send.
+    '''
+    def send(self, message):
+        self.socket.sendto(json.dumps(message).encode('utf-8'), (self.remote_host, self.remote_port))
+
+    '''
+    Logs a message to stderr.
+    Parameters:
+        message: The message to log.
+    '''
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    '''
+    Detects if a message is mangled.
+    Parameters:
+        msg: The message to check.
+    Returns:
+        True if the message is mangled, False otherwise.'''
+    def detect_mangled(self, msg):
+        return 'X' in msg.decode('utf-8')
+
+    def run(self):
+        while True:
+            socks = select.select([self.socket], [], [])[0]
+            for conn in socks:
+                for i in range(4):
+                    data, addr = conn.recvfrom(65535)
+                    # Grab the remote host/port if we don't already have it
+                    if self.remote_host is None:
+                        self.remote_host = addr[0]
+                        self.remote_port = addr[1]
+                    self.log("Received data message %s" % data.decode('utf-8'))
+                    if self.detect_mangled(data):
+                        continue
+                    msg = json.loads(data.decode('utf-8'))
+                    if msg['sequence'] in self.sequence_received: # if duplicate packet, resend the ack
+                        self.send({ "type": "ack", "sequence": msg['sequence'] })
+                        continue
+                    # else, add the packet to received 
+                    self.sequence_received[msg['sequence']] = msg['data']
+                    self.send({ "type": "ack", "sequence": msg['sequence'] })
+                    self.printPacket(msg)
+                    self.printOutOfOrderPacket()
+                    
+
+    '''
+    Prints the packet if it is the next packet in order.
+    Parameters:
+        msg: The message to print.
+    '''
+    def printPacket(self, msg):
+        if msg['sequence'] == self.sequence_count:
+            self.sequence_count += 1
+            print(msg['data'], end='', flush=True)
+
+    '''
+    If we received a packet that was out of order, check to see if we can now print it
+    and repeat for all eligible packets.'''
+    def printOutOfOrderPacket(self):
+        while self.sequence_count in self.sequence_received:
+            print(self.sequence_received[self.sequence_count], end='', flush=True)
+            self.sequence_count += 1
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='receive data')
+    args = parser.parse_args()
+    sender = Receiver()
+    sender.run()
